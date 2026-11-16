@@ -72,7 +72,7 @@ class HomeScreen extends StatelessWidget {
               ),
             ),
             const SizedBox(height: 24),
-            ElevatedButton(onPressed: () {}, child: const Text('Shuru karein')),
+            ElevatedButton(onPressed: () {}, child: const Text('Get Started')),
           ],
         ),
       ),
