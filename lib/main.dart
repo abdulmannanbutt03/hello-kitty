@@ -30,6 +30,31 @@ String? normalizePk(String input) {
   return '+92$d';
 }
 
+String chatIdFor(String a, String b) {
+  final ids = [a, b]..sort();
+  return ids.join('_');
+}
+
+String clockTime(Timestamp? ts) {
+  if (ts == null) return '';
+  final d = ts.toDate();
+  final h = d.hour % 12 == 0 ? 12 : d.hour % 12;
+  final m = d.minute.toString().padLeft(2, '0');
+  return '$h:$m ${d.hour >= 12 ? 'PM' : 'AM'}';
+}
+
+String listTime(Timestamp? ts) {
+  if (ts == null) return '';
+  final d = ts.toDate();
+  final now = DateTime.now();
+  final today = DateTime(now.year, now.month, now.day);
+  final day = DateTime(d.year, d.month, d.day);
+  final diff = today.difference(day).inDays;
+  if (diff == 0) return clockTime(ts);
+  if (diff == 1) return 'Yesterday';
+  return '${d.day}/${d.month}/${d.year % 100}';
+}
+
 class HelloKittyApp extends StatelessWidget {
   const HelloKittyApp({super.key});
 
@@ -379,36 +404,114 @@ class HomeScreen extends StatelessWidget {
           ),
           Expanded(
             child: StreamBuilder<QuerySnapshot<Map<String, dynamic>>>(
-              stream: FirebaseFirestore.instance.collection('users').snapshots(),
-              builder: (context, snap) {
-                if (!snap.hasData) {
-                  return const Center(child: CircularProgressIndicator());
+              stream: FirebaseFirestore.instance
+                  .collection('chats')
+                  .where('participants', arrayContains: user.uid)
+                  .snapshots(),
+              builder: (context, chatSnap) {
+                final chatByUser = <String, Map<String, dynamic>>{};
+                for (final c in chatSnap.data?.docs ?? []) {
+                  final data = c.data();
+                  final parts = List<String>.from(data['participants'] ?? []);
+                  for (final p in parts) {
+                    if (p != user.uid) chatByUser[p] = data;
+                  }
                 }
-                final docs = snap.data!.docs;
-                return ListView(
-                  children: docs.map((d) {
-                    final data = d.data();
-                    final n = (data['name'] ?? '?').toString();
-                    final isMe = d.id == user.uid;
-                    return ListTile(
-                      leading: CircleAvatar(
-                        backgroundColor: kPink,
-                        foregroundColor: Colors.white,
-                        child: Text(n.isEmpty ? '?' : n[0].toUpperCase()),
-                      ),
-                      title: Text(isMe ? '$n (You)' : n),
-                      subtitle: Text((data['phone'] ?? '').toString()),
-                      onTap: isMe
-                          ? null
-                          : () => Navigator.of(context).push(MaterialPageRoute(
-                                builder: (_) => ChatScreen(
-                                  myUid: user.uid,
-                                  otherUid: d.id,
-                                  otherName: n,
+                return StreamBuilder<QuerySnapshot<Map<String, dynamic>>>(
+                  stream:
+                      FirebaseFirestore.instance.collection('users').snapshots(),
+                  builder: (context, snap) {
+                    if (!snap.hasData) {
+                      return const Center(child: CircularProgressIndicator());
+                    }
+                    final people =
+                        snap.data!.docs.where((d) => d.id != user.uid).toList();
+                    int millis(String id) {
+                      final t = chatByUser[id]?['lastTime'];
+                      return t is Timestamp ? t.millisecondsSinceEpoch : 0;
+                    }
+
+                    people.sort((a, b) => millis(b.id).compareTo(millis(a.id)));
+                    if (people.isEmpty) {
+                      return const Center(
+                          child: Text('No friends have joined yet'));
+                    }
+                    return ListView(
+                      children: people.map((d) {
+                        final data = d.data();
+                        final n = (data['name'] ?? '?').toString();
+                        final chat = chatByUser[d.id];
+                        final unreadMap = chat?['unread'];
+                        final unread = (unreadMap is Map
+                                ? (unreadMap[user.uid] ?? 0)
+                                : 0) as num;
+                        final last = chat?['lastMessage']?.toString();
+                        final time = chat?['lastTime'];
+                        return ListTile(
+                          leading: CircleAvatar(
+                            radius: 26,
+                            backgroundColor: kPink,
+                            foregroundColor: Colors.white,
+                            child: Text(n.isEmpty ? '?' : n[0].toUpperCase(),
+                                style: const TextStyle(fontSize: 20)),
+                          ),
+                          title: Text(n,
+                              style:
+                                  const TextStyle(fontWeight: FontWeight.bold)),
+                          subtitle: Text(
+                            last ?? (data['phone'] ?? '').toString(),
+                            maxLines: 1,
+                            overflow: TextOverflow.ellipsis,
+                            style: TextStyle(
+                              color: unread > 0 ? Colors.black87 : Colors.black54,
+                              fontWeight:
+                                  unread > 0 ? FontWeight.w600 : FontWeight.normal,
+                            ),
+                          ),
+                          trailing: Column(
+                            mainAxisSize: MainAxisSize.min,
+                            crossAxisAlignment: CrossAxisAlignment.end,
+                            children: [
+                              Text(
+                                time is Timestamp ? listTime(time) : '',
+                                style: TextStyle(
+                                  fontSize: 12,
+                                  color: unread > 0 ? kDeepPink : Colors.black45,
                                 ),
-                              )),
+                              ),
+                              if (unread > 0) ...[
+                                const SizedBox(height: 4),
+                                Container(
+                                  padding: const EdgeInsets.symmetric(
+                                      horizontal: 7, vertical: 2),
+                                  decoration: BoxDecoration(
+                                    color: kDeepPink,
+                                    borderRadius: BorderRadius.circular(12),
+                                  ),
+                                  child: Text(
+                                    '${unread.toInt()}',
+                                    style: const TextStyle(
+                                        color: Colors.white,
+                                        fontSize: 12,
+                                        fontWeight: FontWeight.bold),
+                                  ),
+                                ),
+                              ],
+                            ],
+                          ),
+                          onTap: () => Navigator.of(context).push(
+                            MaterialPageRoute(
+                              builder: (_) => ChatScreen(
+                                myUid: user.uid,
+                                otherUid: d.id,
+                                otherName: n,
+                              ),
+                            ),
+                          ),
+                        );
+                      }).toList(),
                     );
-                  }).toList(),
+                  },
                 );
               },
             ),
@@ -418,7 +521,6 @@ class HomeScreen extends StatelessWidget {
     );
   }
 }
-
 
 class ChatScreen extends StatefulWidget {
   final String myUid;
@@ -437,29 +539,50 @@ class ChatScreen extends StatefulWidget {
 class _ChatScreenState extends State<ChatScreen> {
   final _controller = TextEditingController();
   late final String _chatId;
+  String? _lastMarked;
 
   @override
   void initState() {
     super.initState();
-    final ids = [widget.myUid, widget.otherUid]..sort();
-    _chatId = ids.join('_');
+    _chatId = chatIdFor(widget.myUid, widget.otherUid);
   }
 
-  CollectionReference<Map<String, dynamic>> get _messages => FirebaseFirestore
-      .instance
-      .collection('chats')
-      .doc(_chatId)
-      .collection('messages');
+  DocumentReference<Map<String, dynamic>> get _chatRef =>
+      FirebaseFirestore.instance.collection('chats').doc(_chatId);
+
+  CollectionReference<Map<String, dynamic>> get _messages =>
+      _chatRef.collection('messages');
 
   Future<void> _send() async {
     final text = _controller.text.trim();
     if (text.isEmpty) return;
     _controller.clear();
-    await _messages.add({
+    final batch = FirebaseFirestore.instance.batch();
+    batch.set(_messages.doc(), {
       'text': text,
       'senderId': widget.myUid,
       'createdAt': FieldValue.serverTimestamp(),
     });
+    batch.set(
+      _chatRef,
+      {
+        'participants': [widget.myUid, widget.otherUid],
+        'lastMessage': text,
+        'lastTime': FieldValue.serverTimestamp(),
+        'lastSenderId': widget.myUid,
+        'unread': {widget.otherUid: FieldValue.increment(1)},
+      },
+      SetOptions(merge: true),
+    );
+    await batch.commit();
+  }
+
+  void _markRead(String latestId) {
+    if (_lastMarked == latestId) return;
+    _lastMarked = latestId;
+    _chatRef.set({
+      'unread': {widget.myUid: 0}
+    }, SetOptions(merge: true));
   }
 
   @override
@@ -482,6 +605,11 @@ class _ChatScreenState extends State<ChatScreen> {
                 if (docs.isEmpty) {
                   return const Center(child: Text('Say hi! \u{1F495}'));
                 }
+                if (docs.first.data()['senderId'] != widget.myUid) {
+                  final id = docs.first.id;
+                  WidgetsBinding.instance
+                      .addPostFrameCallback((_) => _markRead(id));
+                }
                 return ListView.builder(
                   reverse: true,
                   padding: const EdgeInsets.all(12),
@@ -489,25 +617,39 @@ class _ChatScreenState extends State<ChatScreen> {
                   itemBuilder: (context, i) {
                     final m = docs[i].data();
                     final mine = m['senderId'] == widget.myUid;
+                    final ts = m['createdAt'];
                     return Align(
                       alignment:
                           mine ? Alignment.centerRight : Alignment.centerLeft,
                       child: Container(
                         margin: const EdgeInsets.symmetric(vertical: 4),
-                        padding: const EdgeInsets.symmetric(
-                            horizontal: 14, vertical: 10),
+                        padding: const EdgeInsets.fromLTRB(14, 8, 12, 6),
                         constraints: BoxConstraints(
                             maxWidth: MediaQuery.of(context).size.width * 0.75),
                         decoration: BoxDecoration(
                           color: mine ? kDeepPink : Colors.white,
                           borderRadius: BorderRadius.circular(18),
                         ),
-                        child: Text(
-                          (m['text'] ?? '').toString(),
-                          style: TextStyle(
-                            fontSize: 16,
-                            color: mine ? Colors.white : Colors.black87,
-                          ),
+                        child: Column(
+                          crossAxisAlignment: CrossAxisAlignment.end,
+                          mainAxisSize: MainAxisSize.min,
+                          children: [
+                            Text(
+                              (m['text'] ?? '').toString(),
+                              style: TextStyle(
+                                fontSize: 16,
+                                color: mine ? Colors.white : Colors.black87,
+                              ),
+                            ),
+                            const SizedBox(height: 2),
+                            Text(
+                              ts is Timestamp ? clockTime(ts) : '',
+                              style: TextStyle(
+                                fontSize: 11,
+                                color: mine ? Colors.white70 : Colors.black45,
+                              ),
+                            ),
+                          ],
                         ),
                       ),
                     );
