@@ -26,11 +26,24 @@ jobs:
           cp -r tmp_app/android tmp_app/web tmp_app/pubspec.yaml tmp_app/analysis_options.yaml . 2>/dev/null || true
           rm -rf tmp_app
 
+      - name: Install permanent signing key
+        env:
+          KS: ${{ secrets.KEYSTORE_BASE64 }}
+        run: |
+          mkdir -p ~/.android
+          echo "$KS" | base64 -d > ~/.android/debug.keystore
+
       - name: Get packages
         run: flutter pub get
 
-      - name: Build APK
-        run: flutter build apk --release
+      - name: Build APK (with retries)
+        run: |
+          for i in 1 2 3 4; do
+            flutter build apk --release && exit 0
+            echo "Attempt $i failed, waiting 90s before retry..."
+            sleep 90
+          done
+          exit 1
 
       - name: Build Web
         run: flutter build web --release
