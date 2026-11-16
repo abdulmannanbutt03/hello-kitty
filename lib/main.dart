@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:firebase_auth/firebase_auth.dart';
 import 'package:firebase_core/firebase_core.dart';
@@ -53,6 +54,32 @@ String listTime(Timestamp? ts) {
   if (diff == 0) return clockTime(ts);
   if (diff == 1) return 'Yesterday';
   return '${d.day}/${d.month}/${d.year % 100}';
+}
+
+bool isOnlineUser(Map<String, dynamic>? u) {
+  if (u == null || u['online'] != true) return false;
+  final t = u['lastSeen'];
+  if (t is! Timestamp) return true;
+  return DateTime.now().difference(t.toDate()).inSeconds < 90;
+}
+
+String lastSeenText(Timestamp? ts) {
+  if (ts == null) return '';
+  final d = ts.toDate();
+  final now = DateTime.now();
+  final today = DateTime(now.year, now.month, now.day);
+  final day = DateTime(d.year, d.month, d.day);
+  final diff = today.difference(day).inDays;
+  if (diff == 0) return 'last seen today at ${clockTime(ts)}';
+  if (diff == 1) return 'last seen yesterday at ${clockTime(ts)}';
+  return 'last seen ${d.day}/${d.month}/${d.year % 100}';
+}
+
+String presenceText(Map<String, dynamic>? u) {
+  if (u == null) return '';
+  if (isOnlineUser(u)) return 'online';
+  final t = u['lastSeen'];
+  return t is Timestamp ? lastSeenText(t) : '';
 }
 
 class HelloKittyApp extends StatelessWidget {
@@ -375,28 +402,91 @@ class _NameScreenState extends State<NameScreen> {
   }
 }
 
-class HomeScreen extends StatelessWidget {
+class HomeScreen extends StatefulWidget {
   final User user;
   final String name;
   const HomeScreen({super.key, required this.user, required this.name});
 
   @override
+  State<HomeScreen> createState() => _HomeScreenState();
+}
+
+class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
+  Timer? _beat;
+  Timer? _tick;
+
+  DocumentReference<Map<String, dynamic>> get _me =>
+      FirebaseFirestore.instance.collection('users').doc(widget.user.uid);
+
+  @override
+  void initState() {
+    super.initState();
+    WidgetsBinding.instance.addObserver(this);
+    _goOnline();
+    _tick = Timer.periodic(const Duration(seconds: 20), (_) {
+      if (mounted) setState(() {});
+    });
+  }
+
+  @override
+  void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
+    _beat?.cancel();
+    _tick?.cancel();
+    _setPresence(false);
+    super.dispose();
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (state == AppLifecycleState.resumed) {
+      _goOnline();
+    } else if (state != AppLifecycleState.inactive) {
+      _goOffline();
+    }
+  }
+
+  void _goOnline() {
+    _setPresence(true);
+    _beat?.cancel();
+    _beat = Timer.periodic(const Duration(seconds: 30), (_) => _setPresence(true));
+  }
+
+  void _goOffline() {
+    _beat?.cancel();
+    _setPresence(false);
+  }
+
+  Future<void> _setPresence(bool online) async {
+    try {
+      await _me.set({
+        'online': online,
+        'lastSeen': FieldValue.serverTimestamp(),
+      }, SetOptions(merge: true));
+    } catch (_) {}
+  }
+
+  Future<void> _logout() async {
+    _beat?.cancel();
+    await _setPresence(false);
+    await FirebaseAuth.instance.signOut();
+  }
+
+  @override
   Widget build(BuildContext context) {
+    final user = widget.user;
     return Scaffold(
       appBar: AppBar(
         title: const Text('Hello Kitty 🎀'),
         actions: [
-          IconButton(
-            icon: const Icon(Icons.logout),
-            onPressed: () => FirebaseAuth.instance.signOut(),
-          ),
+          IconButton(icon: const Icon(Icons.logout), onPressed: _logout),
         ],
       ),
       body: Column(
         children: [
           Padding(
             padding: const EdgeInsets.all(16),
-            child: Text('Hi $name! 💕',
+            child: Text('Hi ${widget.name}! 💕',
                 style: const TextStyle(
                     fontSize: 22,
                     fontWeight: FontWeight.bold,
@@ -440,32 +530,60 @@ class HomeScreen extends StatelessWidget {
                       children: people.map((d) {
                         final data = d.data();
                         final n = (data['name'] ?? '?').toString();
+                        final online = isOnlineUser(data);
                         final chat = chatByUser[d.id];
                         final unreadMap = chat?['unread'];
                         final unread = (unreadMap is Map
                                 ? (unreadMap[user.uid] ?? 0)
                                 : 0) as num;
+                        final typingMap = chat?['typing'];
+                        final isTyping =
+                            typingMap is Map && typingMap[d.id] == true && online;
                         final last = chat?['lastMessage']?.toString();
                         final time = chat?['lastTime'];
                         return ListTile(
-                          leading: CircleAvatar(
-                            radius: 26,
-                            backgroundColor: kPink,
-                            foregroundColor: Colors.white,
-                            child: Text(n.isEmpty ? '?' : n[0].toUpperCase(),
-                                style: const TextStyle(fontSize: 20)),
+                          leading: Stack(
+                            children: [
+                              CircleAvatar(
+                                radius: 26,
+                                backgroundColor: kPink,
+                                foregroundColor: Colors.white,
+                                child: Text(n.isEmpty ? '?' : n[0].toUpperCase(),
+                                    style: const TextStyle(fontSize: 20)),
+                              ),
+                              if (online)
+                                Positioned(
+                                  right: 0,
+                                  bottom: 0,
+                                  child: Container(
+                                    width: 14,
+                                    height: 14,
+                                    decoration: BoxDecoration(
+                                      color: Colors.green,
+                                      shape: BoxShape.circle,
+                                      border:
+                                          Border.all(color: kLightPink, width: 2),
+                                    ),
+                                  ),
+                                ),
+                            ],
                           ),
                           title: Text(n,
                               style:
                                   const TextStyle(fontWeight: FontWeight.bold)),
                           subtitle: Text(
-                            last ?? (data['phone'] ?? '').toString(),
+                            isTyping
+                                ? 'typing…'
+                                : (last ?? (data['phone'] ?? '').toString()),
                             maxLines: 1,
                             overflow: TextOverflow.ellipsis,
                             style: TextStyle(
-                              color: unread > 0 ? Colors.black87 : Colors.black54,
-                              fontWeight:
-                                  unread > 0 ? FontWeight.w600 : FontWeight.normal,
+                              color: isTyping
+                                  ? kDeepPink
+                                  : (unread > 0 ? Colors.black87 : Colors.black54),
+                              fontWeight: (unread > 0 || isTyping)
+                                  ? FontWeight.w600
+                                  : FontWeight.normal,
                             ),
                           ),
                           trailing: Column(
@@ -540,11 +658,26 @@ class _ChatScreenState extends State<ChatScreen> {
   final _controller = TextEditingController();
   late final String _chatId;
   String? _lastMarked;
+  bool _isTyping = false;
+  Timer? _typingStop;
+  Timer? _ticker;
 
   @override
   void initState() {
     super.initState();
     _chatId = chatIdFor(widget.myUid, widget.otherUid);
+    _ticker = Timer.periodic(const Duration(seconds: 15), (_) {
+      if (mounted) setState(() {});
+    });
+  }
+
+  @override
+  void dispose() {
+    _stopTyping();
+    _typingStop?.cancel();
+    _ticker?.cancel();
+    _controller.dispose();
+    super.dispose();
   }
 
   DocumentReference<Map<String, dynamic>> get _chatRef =>
@@ -553,10 +686,35 @@ class _ChatScreenState extends State<ChatScreen> {
   CollectionReference<Map<String, dynamic>> get _messages =>
       _chatRef.collection('messages');
 
+  void _onTyping(String value) {
+    if (value.trim().isEmpty) {
+      _stopTyping();
+      return;
+    }
+    if (!_isTyping) {
+      _isTyping = true;
+      _chatRef.set({
+        'typing': {widget.myUid: true}
+      }, SetOptions(merge: true));
+    }
+    _typingStop?.cancel();
+    _typingStop = Timer(const Duration(seconds: 2), _stopTyping);
+  }
+
+  void _stopTyping() {
+    _typingStop?.cancel();
+    if (!_isTyping) return;
+    _isTyping = false;
+    _chatRef.set({
+      'typing': {widget.myUid: false}
+    }, SetOptions(merge: true));
+  }
+
   Future<void> _send() async {
     final text = _controller.text.trim();
     if (text.isEmpty) return;
     _controller.clear();
+    _stopTyping();
     final batch = FirebaseFirestore.instance.batch();
     batch.set(_messages.doc(), {
       'text': text,
@@ -585,10 +743,49 @@ class _ChatScreenState extends State<ChatScreen> {
     }, SetOptions(merge: true));
   }
 
+  Widget _title() {
+    return StreamBuilder<DocumentSnapshot<Map<String, dynamic>>>(
+      stream: FirebaseFirestore.instance
+          .collection('users')
+          .doc(widget.otherUid)
+          .snapshots(),
+      builder: (context, userSnap) {
+        return StreamBuilder<DocumentSnapshot<Map<String, dynamic>>>(
+          stream: _chatRef.snapshots(),
+          builder: (context, chatSnap) {
+            final u = userSnap.data?.data();
+            final c = chatSnap.data?.data();
+            final typingMap = c?['typing'];
+            final typing = typingMap is Map &&
+                typingMap[widget.otherUid] == true &&
+                isOnlineUser(u);
+            final status = typing ? 'typing…' : presenceText(u);
+            return Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Text(widget.otherName,
+                    style: const TextStyle(
+                        fontSize: 20,
+                        fontWeight: FontWeight.bold,
+                        color: Colors.white)),
+                if (status.isNotEmpty)
+                  Text(status,
+                      style: const TextStyle(
+                          fontSize: 12,
+                          fontWeight: FontWeight.normal,
+                          color: Colors.white70)),
+              ],
+            );
+          },
+        );
+      },
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      appBar: AppBar(title: Text(widget.otherName)),
+      appBar: AppBar(title: _title()),
       body: Column(
         children: [
           Expanded(
@@ -667,6 +864,7 @@ class _ChatScreenState extends State<ChatScreen> {
                     child: TextField(
                       controller: _controller,
                       textCapitalization: TextCapitalization.sentences,
+                      onChanged: _onTyping,
                       onSubmitted: (_) => _send(),
                       decoration: const InputDecoration(hintText: 'Type a message'),
                     ),
