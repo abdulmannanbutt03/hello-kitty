@@ -33,8 +33,11 @@ jobs:
           mkdir -p ~/.android
           echo "$KS" | base64 -d > ~/.android/debug.keystore
 
+      - name: Add microphone permission
+        run: sed -i 's#<application#<uses-permission android:name="android.permission.RECORD_AUDIO"/>\n    <application#' android/app/src/main/AndroidManifest.xml
+
       - name: Add Firebase packages
-        run: flutter pub add firebase_core firebase_auth cloud_firestore
+        run: flutter pub add firebase_core firebase_auth cloud_firestore http image_picker record audioplayers video_player
 
       - name: Build APK (with retries)
         run: |
