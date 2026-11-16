@@ -1,0 +1,46 @@
+name: Build Hello Kitty
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+
+      - name: Create project skeleton
+        run: |
+          flutter create --org com.hellokitty --project-name hello_kitty --platforms android,web tmp_app
+          cp -r tmp_app/android tmp_app/web tmp_app/pubspec.yaml tmp_app/analysis_options.yaml . 2>/dev/null || true
+          rm -rf tmp_app
+
+      - name: Get packages
+        run: flutter pub get
+
+      - name: Build APK
+        run: flutter build apk --release
+
+      - name: Build Web
+        run: flutter build web --release
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: hello-kitty-apk
+          path: build/app/outputs/flutter-apk/app-release.apk
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: hello-kitty-web
+          path: build/web
