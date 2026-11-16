@@ -1,4 +1,11 @@
 import 'dart:async';
+import 'dart:io';
+import 'dart:math';
+import 'package:audioplayers/audioplayers.dart';
+import 'package:http/http.dart' as http;
+import 'package:image_picker/image_picker.dart';
+import 'package:record/record.dart';
+import 'package:video_player/video_player.dart';
 import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:firebase_auth/firebase_auth.dart';
 import 'package:firebase_core/firebase_core.dart';
@@ -80,6 +87,43 @@ String presenceText(Map<String, dynamic>? u) {
   if (isOnlineUser(u)) return 'online';
   final t = u['lastSeen'];
   return t is Timestamp ? lastSeenText(t) : '';
+}
+
+const String supabaseUrl = 'https://hjqbibvqxhurgmtrqqre.supabase.co';
+const String supabaseKey = 'sb_publishable_OnPlqyYikyD117VZTM80yw_3dYFjpRQ';
+const String mediaBucket = 'chat-media';
+
+String randomHex(int bytes) {
+  final r = Random.secure();
+  return List.generate(
+      bytes, (_) => r.nextInt(256).toRadixString(16).padLeft(2, '0')).join();
+}
+
+String fmtDur(int seconds) {
+  final m = seconds ~/ 60;
+  final sec = (seconds % 60).toString().padLeft(2, '0');
+  return '$m:$sec';
+}
+
+Future<String> uploadToSupabase(
+    File file, String folder, String ext, String contentType) async {
+  final path = '$folder/${randomHex(16)}.$ext';
+  final headers = <String, String>{
+    'apikey': supabaseKey,
+    'Content-Type': contentType,
+  };
+  if (supabaseKey.startsWith('eyJ')) {
+    headers['Authorization'] = 'Bearer $supabaseKey';
+  }
+  final res = await http.post(
+    Uri.parse('$supabaseUrl/storage/v1/object/$mediaBucket/$path'),
+    headers: headers,
+    body: await file.readAsBytes(),
+  );
+  if (res.statusCode != 200 && res.statusCode != 201) {
+    throw Exception('Upload failed (${res.statusCode}): ${res.body}');
+  }
+  return '$supabaseUrl/storage/v1/object/public/$mediaBucket/$path';
 }
 
 class HelloKittyApp extends StatelessWidget {
@@ -656,11 +700,18 @@ class ChatScreen extends StatefulWidget {
 
 class _ChatScreenState extends State<ChatScreen> {
   final _controller = TextEditingController();
+  final _picker = ImagePicker();
+  final _recorder = AudioRecorder();
   late final String _chatId;
   String? _lastMarked;
   bool _isTyping = false;
+  bool _uploading = false;
+  bool _recording = false;
+  int _recSeconds = 0;
+  String? _recPath;
   Timer? _typingStop;
   Timer? _ticker;
+  Timer? _recTimer;
 
   @override
   void initState() {
@@ -676,6 +727,8 @@ class _ChatScreenState extends State<ChatScreen> {
     _stopTyping();
     _typingStop?.cancel();
     _ticker?.cancel();
+    _recTimer?.cancel();
+    _recorder.dispose();
     _controller.dispose();
     super.dispose();
   }
@@ -687,6 +740,7 @@ class _ChatScreenState extends State<ChatScreen> {
       _chatRef.collection('messages');
 
   void _onTyping(String value) {
+    setState(() {});
     if (value.trim().isEmpty) {
       _stopTyping();
       return;
@@ -710,14 +764,19 @@ class _ChatScreenState extends State<ChatScreen> {
     }, SetOptions(merge: true));
   }
 
-  Future<void> _send() async {
-    final text = _controller.text.trim();
-    if (text.isEmpty) return;
-    _controller.clear();
-    _stopTyping();
+  Future<void> _sendMessage({
+    required String type,
+    required String preview,
+    String text = '',
+    String? url,
+    int? seconds,
+  }) async {
     final batch = FirebaseFirestore.instance.batch();
     batch.set(_messages.doc(), {
+      'type': type,
       'text': text,
+      if (url != null) 'url': url,
+      if (seconds != null) 'seconds': seconds,
       'senderId': widget.myUid,
       'createdAt': FieldValue.serverTimestamp(),
     });
@@ -725,7 +784,7 @@ class _ChatScreenState extends State<ChatScreen> {
       _chatRef,
       {
         'participants': [widget.myUid, widget.otherUid],
-        'lastMessage': text,
+        'lastMessage': preview,
         'lastTime': FieldValue.serverTimestamp(),
         'lastSenderId': widget.myUid,
         'unread': {widget.otherUid: FieldValue.increment(1)},
@@ -733,6 +792,159 @@ class _ChatScreenState extends State<ChatScreen> {
       SetOptions(merge: true),
     );
     await batch.commit();
+  }
+
+  Future<void> _sendText() async {
+    final text = _controller.text.trim();
+    if (text.isEmpty) return;
+    _controller.clear();
+    _stopTyping();
+    setState(() {});
+    await _sendMessage(type: 'text', text: text, preview: text);
+  }
+
+  Future<void> _uploadAndSend({
+    required File file,
+    required String type,
+    required String ext,
+    required String contentType,
+    required String preview,
+    int? seconds,
+  }) async {
+    setState(() => _uploading = true);
+    try {
+      final size = await file.length();
+      if (size > 50 * 1024 * 1024) {
+        throw Exception('File is bigger than 50 MB');
+      }
+      final url = await uploadToSupabase(file, widget.myUid, ext, contentType);
+      await _sendMessage(
+          type: type, url: url, seconds: seconds, preview: preview);
+    } catch (e) {
+      if (mounted) showMsg(context, 'Could not send: $e');
+    } finally {
+      if (mounted) setState(() => _uploading = false);
+    }
+  }
+
+  Future<void> _pickImage(ImageSource source) async {
+    final x = await _picker.pickImage(
+        source: source, maxWidth: 1600, imageQuality: 80);
+    if (x == null) return;
+    await _uploadAndSend(
+      file: File(x.path),
+      type: 'image',
+      ext: 'jpg',
+      contentType: 'image/jpeg',
+      preview: '📷 Photo',
+    );
+  }
+
+  Future<void> _pickVideo(ImageSource source) async {
+    final x = await _picker.pickVideo(
+        source: source, maxDuration: const Duration(minutes: 2));
+    if (x == null) return;
+    await _uploadAndSend(
+      file: File(x.path),
+      type: 'video',
+      ext: 'mp4',
+      contentType: 'video/mp4',
+      preview: '🎥 Video',
+    );
+  }
+
+  void _showAttach() {
+    showModalBottomSheet(
+      context: context,
+      builder: (ctx) => SafeArea(
+        child: Wrap(
+          children: [
+            ListTile(
+              leading: const Icon(Icons.photo, color: kDeepPink),
+              title: const Text('Photo from gallery'),
+              onTap: () {
+                Navigator.pop(ctx);
+                _pickImage(ImageSource.gallery);
+              },
+            ),
+            ListTile(
+              leading: const Icon(Icons.photo_camera, color: kDeepPink),
+              title: const Text('Take a photo'),
+              onTap: () {
+                Navigator.pop(ctx);
+                _pickImage(ImageSource.camera);
+              },
+            ),
+            ListTile(
+              leading: const Icon(Icons.video_library, color: kDeepPink),
+              title: const Text('Video from gallery'),
+              onTap: () {
+                Navigator.pop(ctx);
+                _pickVideo(ImageSource.gallery);
+              },
+            ),
+            ListTile(
+              leading: const Icon(Icons.videocam, color: kDeepPink),
+              title: const Text('Record a video'),
+              onTap: () {
+                Navigator.pop(ctx);
+                _pickVideo(ImageSource.camera);
+              },
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Future<void> _startRecording() async {
+    try {
+      if (!await _recorder.hasPermission()) {
+        if (mounted) showMsg(context, 'Microphone permission is needed');
+        return;
+      }
+      final path =
+          '${Directory.systemTemp.path}/rec_${DateTime.now().millisecondsSinceEpoch}.m4a';
+      await _recorder.start(
+        const RecordConfig(encoder: AudioEncoder.aacLc),
+        path: path,
+      );
+      _recPath = path;
+      _recSeconds = 0;
+      _recTimer?.cancel();
+      _recTimer = Timer.periodic(const Duration(seconds: 1), (_) {
+        if (mounted) setState(() => _recSeconds++);
+      });
+      setState(() => _recording = true);
+    } catch (e) {
+      if (mounted) showMsg(context, 'Could not record: $e');
+    }
+  }
+
+  Future<void> _finishRecording({required bool send}) async {
+    _recTimer?.cancel();
+    final seconds = _recSeconds;
+    String? path;
+    try {
+      path = await _recorder.stop();
+    } catch (_) {}
+    path ??= _recPath;
+    if (mounted) setState(() => _recording = false);
+    if (path == null) return;
+    if (!send || seconds < 1) {
+      try {
+        await File(path).delete();
+      } catch (_) {}
+      return;
+    }
+    await _uploadAndSend(
+      file: File(path),
+      type: 'audio',
+      ext: 'm4a',
+      contentType: 'audio/mp4',
+      preview: '🎤 Voice message (${fmtDur(seconds)})',
+      seconds: seconds,
+    );
   }
 
   void _markRead(String latestId) {
@@ -782,6 +994,117 @@ class _ChatScreenState extends State<ChatScreen> {
     );
   }
 
+  Widget _content(Map<String, dynamic> m, bool mine) {
+    final type = (m['type'] ?? 'text').toString();
+    final url = (m['url'] ?? '').toString();
+    switch (type) {
+      case 'image':
+        return GestureDetector(
+          onTap: () => Navigator.of(context).push(
+              MaterialPageRoute(builder: (_) => ImageViewerScreen(url: url))),
+          child: ClipRRect(
+            borderRadius: BorderRadius.circular(12),
+            child: Image.network(
+              url,
+              width: 220,
+              height: 220,
+              fit: BoxFit.cover,
+              loadingBuilder: (c, child, p) => p == null
+                  ? child
+                  : const SizedBox(
+                      width: 220,
+                      height: 220,
+                      child: Center(child: CircularProgressIndicator())),
+              errorBuilder: (c, e, s) => const SizedBox(
+                  width: 220,
+                  height: 120,
+                  child: Center(child: Text('Image failed to load'))),
+            ),
+          ),
+        );
+      case 'video':
+        return GestureDetector(
+          onTap: () => Navigator.of(context).push(
+              MaterialPageRoute(builder: (_) => VideoScreen(url: url))),
+          child: Container(
+            width: 220,
+            height: 140,
+            decoration: BoxDecoration(
+              color: Colors.black87,
+              borderRadius: BorderRadius.circular(12),
+            ),
+            child: const Center(
+              child: Icon(Icons.play_circle_fill, color: Colors.white, size: 56),
+            ),
+          ),
+        );
+      case 'audio':
+        return AudioBubble(
+            url: url, seconds: (m['seconds'] ?? 0) as int, mine: mine);
+      default:
+        return Text(
+          (m['text'] ?? '').toString(),
+          style: TextStyle(
+            fontSize: 16,
+            color: mine ? Colors.white : Colors.black87,
+          ),
+        );
+    }
+  }
+
+  Widget _inputBar() {
+    if (_recording) {
+      return Row(
+        children: [
+          IconButton(
+            icon: const Icon(Icons.delete, color: Colors.red),
+            onPressed: () => _finishRecording(send: false),
+          ),
+          const Icon(Icons.fiber_manual_record, color: Colors.red, size: 14),
+          const SizedBox(width: 6),
+          Text(fmtDur(_recSeconds),
+              style: const TextStyle(fontSize: 18, fontWeight: FontWeight.bold)),
+          const Expanded(child: SizedBox()),
+          CircleAvatar(
+            backgroundColor: kDeepPink,
+            child: IconButton(
+              icon: const Icon(Icons.send, color: Colors.white),
+              onPressed: () => _finishRecording(send: true),
+            ),
+          ),
+        ],
+      );
+    }
+    final hasText = _controller.text.trim().isNotEmpty;
+    return Row(
+      children: [
+        IconButton(
+          icon: const Icon(Icons.attach_file, color: kDeepPink),
+          onPressed: _uploading ? null : _showAttach,
+        ),
+        Expanded(
+          child: TextField(
+            controller: _controller,
+            textCapitalization: TextCapitalization.sentences,
+            onChanged: _onTyping,
+            onSubmitted: (_) => _sendText(),
+            decoration: const InputDecoration(hintText: 'Type a message'),
+          ),
+        ),
+        const SizedBox(width: 8),
+        CircleAvatar(
+          backgroundColor: kDeepPink,
+          child: IconButton(
+            icon: Icon(hasText ? Icons.send : Icons.mic, color: Colors.white),
+            onPressed: hasText
+                ? _sendText
+                : (_uploading ? null : _startRecording),
+          ),
+        ),
+      ],
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
     return Scaffold(
@@ -820,9 +1143,9 @@ class _ChatScreenState extends State<ChatScreen> {
                           mine ? Alignment.centerRight : Alignment.centerLeft,
                       child: Container(
                         margin: const EdgeInsets.symmetric(vertical: 4),
-                        padding: const EdgeInsets.fromLTRB(14, 8, 12, 6),
+                        padding: const EdgeInsets.fromLTRB(10, 8, 10, 6),
                         constraints: BoxConstraints(
-                            maxWidth: MediaQuery.of(context).size.width * 0.75),
+                            maxWidth: MediaQuery.of(context).size.width * 0.78),
                         decoration: BoxDecoration(
                           color: mine ? kDeepPink : Colors.white,
                           borderRadius: BorderRadius.circular(18),
@@ -831,13 +1154,7 @@ class _ChatScreenState extends State<ChatScreen> {
                           crossAxisAlignment: CrossAxisAlignment.end,
                           mainAxisSize: MainAxisSize.min,
                           children: [
-                            Text(
-                              (m['text'] ?? '').toString(),
-                              style: TextStyle(
-                                fontSize: 16,
-                                color: mine ? Colors.white : Colors.black87,
-                              ),
-                            ),
+                            _content(m, mine),
                             const SizedBox(height: 2),
                             Text(
                               ts is Timestamp ? clockTime(ts) : '',
@@ -855,34 +1172,198 @@ class _ChatScreenState extends State<ChatScreen> {
               },
             ),
           ),
+          if (_uploading) const LinearProgressIndicator(color: kDeepPink),
           SafeArea(
             child: Padding(
-              padding: const EdgeInsets.fromLTRB(12, 4, 12, 8),
-              child: Row(
-                children: [
-                  Expanded(
-                    child: TextField(
-                      controller: _controller,
-                      textCapitalization: TextCapitalization.sentences,
-                      onChanged: _onTyping,
-                      onSubmitted: (_) => _send(),
-                      decoration: const InputDecoration(hintText: 'Type a message'),
-                    ),
-                  ),
-                  const SizedBox(width: 8),
-                  CircleAvatar(
-                    backgroundColor: kDeepPink,
-                    child: IconButton(
-                      icon: const Icon(Icons.send, color: Colors.white),
-                      onPressed: _send,
-                    ),
-                  ),
-                ],
-              ),
+              padding: const EdgeInsets.fromLTRB(8, 4, 12, 8),
+              child: _inputBar(),
             ),
           ),
         ],
       ),
+    );
+  }
+}
+
+class ImageViewerScreen extends StatelessWidget {
+  final String url;
+  const ImageViewerScreen({super.key, required this.url});
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      backgroundColor: Colors.black,
+      appBar: AppBar(
+        backgroundColor: Colors.black,
+        foregroundColor: Colors.white,
+      ),
+      body: Center(
+        child: InteractiveViewer(
+          child: Image.network(url, fit: BoxFit.contain),
+        ),
+      ),
+    );
+  }
+}
+
+class VideoScreen extends StatefulWidget {
+  final String url;
+  const VideoScreen({super.key, required this.url});
+  @override
+  State<VideoScreen> createState() => _VideoScreenState();
+}
+
+class _VideoScreenState extends State<VideoScreen> {
+  late final VideoPlayerController _c;
+  bool _ready = false;
+  bool _failed = false;
+
+  @override
+  void initState() {
+    super.initState();
+    _c = VideoPlayerController.networkUrl(Uri.parse(widget.url));
+    _c.initialize().then((_) {
+      if (!mounted) return;
+      setState(() => _ready = true);
+      _c.play();
+    }).catchError((_) {
+      if (mounted) setState(() => _failed = true);
+    });
+    _c.addListener(() {
+      if (mounted) setState(() {});
+    });
+  }
+
+  @override
+  void dispose() {
+    _c.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      backgroundColor: Colors.black,
+      appBar: AppBar(
+        backgroundColor: Colors.black,
+        foregroundColor: Colors.white,
+      ),
+      body: Center(
+        child: _failed
+            ? const Text('Video failed to load',
+                style: TextStyle(color: Colors.white))
+            : _ready
+                ? AspectRatio(
+                    aspectRatio: _c.value.aspectRatio,
+                    child: VideoPlayer(_c),
+                  )
+                : const CircularProgressIndicator(),
+      ),
+      floatingActionButton: _ready
+          ? FloatingActionButton(
+              backgroundColor: kDeepPink,
+              onPressed: () =>
+                  _c.value.isPlaying ? _c.pause() : _c.play(),
+              child: Icon(
+                _c.value.isPlaying ? Icons.pause : Icons.play_arrow,
+                color: Colors.white,
+              ),
+            )
+          : null,
+    );
+  }
+}
+
+class AudioBubble extends StatefulWidget {
+  final String url;
+  final int seconds;
+  final bool mine;
+  const AudioBubble(
+      {super.key, required this.url, required this.seconds, required this.mine});
+  @override
+  State<AudioBubble> createState() => _AudioBubbleState();
+}
+
+class _AudioBubbleState extends State<AudioBubble> {
+  final AudioPlayer _p = AudioPlayer();
+  bool _playing = false;
+  bool _started = false;
+  Duration _pos = Duration.zero;
+  Duration? _dur;
+  final List<StreamSubscription> _subs = [];
+
+  @override
+  void initState() {
+    super.initState();
+    _subs.add(_p.onPlayerStateChanged.listen((s) {
+      if (mounted) setState(() => _playing = s == PlayerState.playing);
+    }));
+    _subs.add(_p.onPositionChanged.listen((d) {
+      if (mounted) setState(() => _pos = d);
+    }));
+    _subs.add(_p.onDurationChanged.listen((d) {
+      if (mounted) setState(() => _dur = d);
+    }));
+    _subs.add(_p.onPlayerComplete.listen((_) {
+      if (mounted) {
+        setState(() {
+          _pos = Duration.zero;
+          _playing = false;
+          _started = false;
+        });
+      }
+    }));
+  }
+
+  @override
+  void dispose() {
+    for (final s in _subs) {
+      s.cancel();
+    }
+    _p.dispose();
+    super.dispose();
+  }
+
+  Future<void> _toggle() async {
+    if (_playing) {
+      await _p.pause();
+    } else if (_started) {
+      await _p.resume();
+    } else {
+      _started = true;
+      await _p.play(UrlSource(widget.url));
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final color = widget.mine ? Colors.white : kDeepPink;
+    final total = _dur?.inSeconds ?? widget.seconds;
+    final progress = (total > 0 && _dur != null)
+        ? (_pos.inMilliseconds / _dur!.inMilliseconds).clamp(0.0, 1.0)
+        : 0.0;
+    return Row(
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        IconButton(
+          icon: Icon(_playing ? Icons.pause_circle : Icons.play_circle,
+              color: color, size: 36),
+          onPressed: _toggle,
+        ),
+        SizedBox(
+          width: 110,
+          child: LinearProgressIndicator(
+            value: progress,
+            color: color,
+            backgroundColor: color.withAlpha(70),
+          ),
+        ),
+        const SizedBox(width: 8),
+        Text(
+          fmtDur(_playing || _pos > Duration.zero ? _pos.inSeconds : total),
+          style: TextStyle(color: color, fontSize: 13),
+        ),
+      ],
     );
   }
 }
