@@ -398,11 +398,147 @@ class HomeScreen extends StatelessWidget {
                       ),
                       title: Text(isMe ? '$n (You)' : n),
                       subtitle: Text((data['phone'] ?? '').toString()),
-                      onTap: () => showMsg(context, 'Chat is coming in the next step'),
+                      onTap: isMe
+                          ? null
+                          : () => Navigator.of(context).push(MaterialPageRoute(
+                                builder: (_) => ChatScreen(
+                                  myUid: user.uid,
+                                  otherUid: d.id,
+                                  otherName: n,
+                                ),
+                              )),
                     );
                   }).toList(),
                 );
               },
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+
+class ChatScreen extends StatefulWidget {
+  final String myUid;
+  final String otherUid;
+  final String otherName;
+  const ChatScreen({
+    super.key,
+    required this.myUid,
+    required this.otherUid,
+    required this.otherName,
+  });
+  @override
+  State<ChatScreen> createState() => _ChatScreenState();
+}
+
+class _ChatScreenState extends State<ChatScreen> {
+  final _controller = TextEditingController();
+  late final String _chatId;
+
+  @override
+  void initState() {
+    super.initState();
+    final ids = [widget.myUid, widget.otherUid]..sort();
+    _chatId = ids.join('_');
+  }
+
+  CollectionReference<Map<String, dynamic>> get _messages => FirebaseFirestore
+      .instance
+      .collection('chats')
+      .doc(_chatId)
+      .collection('messages');
+
+  Future<void> _send() async {
+    final text = _controller.text.trim();
+    if (text.isEmpty) return;
+    _controller.clear();
+    await _messages.add({
+      'text': text,
+      'senderId': widget.myUid,
+      'createdAt': FieldValue.serverTimestamp(),
+    });
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(title: Text(widget.otherName)),
+      body: Column(
+        children: [
+          Expanded(
+            child: StreamBuilder<QuerySnapshot<Map<String, dynamic>>>(
+              stream: _messages.orderBy('createdAt', descending: true).snapshots(),
+              builder: (context, snap) {
+                if (snap.hasError) {
+                  return Center(child: Text('Error: ${snap.error}'));
+                }
+                if (!snap.hasData) {
+                  return const Center(child: CircularProgressIndicator());
+                }
+                final docs = snap.data!.docs;
+                if (docs.isEmpty) {
+                  return const Center(child: Text('Say hi! \u{1F495}'));
+                }
+                return ListView.builder(
+                  reverse: true,
+                  padding: const EdgeInsets.all(12),
+                  itemCount: docs.length,
+                  itemBuilder: (context, i) {
+                    final m = docs[i].data();
+                    final mine = m['senderId'] == widget.myUid;
+                    return Align(
+                      alignment:
+                          mine ? Alignment.centerRight : Alignment.centerLeft,
+                      child: Container(
+                        margin: const EdgeInsets.symmetric(vertical: 4),
+                        padding: const EdgeInsets.symmetric(
+                            horizontal: 14, vertical: 10),
+                        constraints: BoxConstraints(
+                            maxWidth: MediaQuery.of(context).size.width * 0.75),
+                        decoration: BoxDecoration(
+                          color: mine ? kDeepPink : Colors.white,
+                          borderRadius: BorderRadius.circular(18),
+                        ),
+                        child: Text(
+                          (m['text'] ?? '').toString(),
+                          style: TextStyle(
+                            fontSize: 16,
+                            color: mine ? Colors.white : Colors.black87,
+                          ),
+                        ),
+                      ),
+                    );
+                  },
+                );
+              },
+            ),
+          ),
+          SafeArea(
+            child: Padding(
+              padding: const EdgeInsets.fromLTRB(12, 4, 12, 8),
+              child: Row(
+                children: [
+                  Expanded(
+                    child: TextField(
+                      controller: _controller,
+                      textCapitalization: TextCapitalization.sentences,
+                      onSubmitted: (_) => _send(),
+                      decoration: const InputDecoration(hintText: 'Type a message'),
+                    ),
+                  ),
+                  const SizedBox(width: 8),
+                  CircleAvatar(
+                    backgroundColor: kDeepPink,
+                    child: IconButton(
+                      icon: const Icon(Icons.send, color: Colors.white),
+                      onPressed: _send,
+                    ),
+                  ),
+                ],
+              ),
             ),
           ),
         ],
